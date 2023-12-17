@@ -2,7 +2,7 @@ use rand::{Rng, thread_rng};
 use bevy::prelude::*;
 use bevy_rapier2d::prelude::*;
 use bevy_prototype_lyon::prelude::*;
-
+use rayon::prelude::*;
 
 
 pub struct Density {
@@ -14,8 +14,8 @@ struct Particle;
 
 fn smoothing_kernel(r: f32, d: f32) -> f32 {
     let volume: f32 = 78539816.0;
-    let r_squared: f32 = r.powf(2.0);
-    let d_squared: f32 = d.powf(2.0);
+    let r_squared = r.powi(2);
+    let d_squared = d.powi(2);
     let squared_distance: f32 = r_squared - d_squared;
 
     let value = if squared_distance > 0.0 { 
@@ -24,7 +24,7 @@ fn smoothing_kernel(r: f32, d: f32) -> f32 {
         // println!("Squared Distance: {}\n", squared_distance);
         squared_distance
     } else { 
-        0.0 
+        return 0.0; 
     };
     let normalized_value = value.powi(3) / volume;
 
@@ -41,18 +41,22 @@ struct Cell {
 }
 
 impl Cell {
-    pub fn update(&mut self, center: &Transform, particles: &Vec<(&Particle, &Transform)>) {
-        let mut density: f32 = 0.0;
-        const mass: f32 = 1.0;
+    pub fn update_density(&mut self, density: f32) {
+        self.density += density;
+    }
 
-        for (_, transform) in particles {
-            let vector = center.translation - transform.translation;
-            let distance = vector.length();
-            let influence = smoothing_kernel(75.0, distance);
-            density += mass * influence;
-        }
+    pub fn reset_density(&mut self) {
+        self.density = 0.0;
+    }
 
-        self.density = density;
+    pub fn update_cell_colour(&self, fill: &mut Fill) {
+        
+        let red = self.density; 
+        let blue = 1.0 - self.density; 
+        let green = 1.0 - (red - blue).abs();
+    
+        let colour = Color::rgb(red, green, blue);
+        fill.color = colour;
     }
 }
 
@@ -63,8 +67,8 @@ fn main() {
 
     let cell_size = 20.0;
     let particle_radius: f32 = 4.0;
-    let n_particles: usize = 160;
-    let particle_spacing: f32 = 4.0;
+    let n_particles: usize = 100;
+    let particle_spacing: f32 = 50.0;
 
     App::new()
         .insert_resource(Msaa::Off)
@@ -86,10 +90,16 @@ fn main() {
         .add_systems(Startup, move |commands: Commands|
             setup_bounding_box(commands, &window_width, &window_height))
         .add_systems(Startup, move |commands: Commands| 
-            setup_particles(commands, &particle_radius, &n_particles, &particle_spacing)) 
+            setup_particles(commands, &particle_radius, &n_particles, 
+                            &particle_spacing))
         .add_systems(Update, 
-            (repulsion_system, update_cell_density)
+            (calculate_density)
         )
+        .add_systems(PostUpdate, |mut query: Query<&mut Cell>| {
+            for mut cell in query.iter_mut() {
+                cell.reset_density();
+            }
+        })
         .run();
 }
 
@@ -207,9 +217,9 @@ fn setup_particles(mut commands: Commands,
             .insert(TransformBundle::from(
                 Transform::from_xyz(x, y, 0.0)
             ))
-            .insert(Collider::ball(*particle_radius))
             .insert(CollisionGroups::new(g1, g2))
             .insert(GravityScale(0.0))
+            .insert(Velocity::linear(Vec2::new(100.0, 10.0)))
             .insert(ExternalForce {
                 force: Vec2::ZERO.into(),
                 torque: 0.0, 
@@ -218,68 +228,95 @@ fn setup_particles(mut commands: Commands,
     }
 }
 
-fn repulsion_system(mut query: Query<(&mut ExternalForce, &Transform)>,) {
-    // Collecting entities and their associated data
-    let particles: Vec<_> = query.iter_mut().collect();
-    let particle_count = particles.len();
-
-    // Preparing a vector to store calculated forces
-    let mut forces = vec![Vec3::ZERO; particle_count];
-
-    // Calculating forces
-    for i in 0..particle_count {
-        for j in 0..particle_count {
-            if i != j {
-                let (_, transform1) = &particles[i];
-                let (_, transform2) = &particles[j];
-                
-                let direction = transform1.translation - transform2.translation;
-                let distance = direction.length();
-                let force = (direction.normalize() / distance.powi(2)) * 10000000.0;
-                forces[i] += force;
-            }
-        }
-    }
-
-    // Applying the forces
-    for (i, (mut force, _)) in particles.into_iter().enumerate() {
-        force.force.x = forces[i].x;
-        force.force.y = forces[i].y;
-    }
-}
-
-fn update_cell_density(mut cell_query: Query<(&mut Cell, &Transform, &mut Fill)>,
-                       particle_query: Query<(&Particle, &Transform)>) {
-
-
-    for (mut cell, cell_transform, mut fill) in cell_query.iter_mut() {
-        // Get the position of the cell
-        let cell_position = cell_transform.translation;
-
-        // Filter the particles based on the distance to the cell
-        let nearby_particles: Vec<_> = particle_query.iter()
-        .filter(|(_, particle_transform)| {
-            let distance_squared = (cell_position - particle_transform.translation).length_squared();
-            distance_squared <= (75.0 * 75.0)
-        })
+fn calculate_density(pos_query: Query<(&Transform, With<Particle>)>,
+                     mut cell_query: Query<(Entity, &Transform, &mut Cell, &mut Fill)>) {
+    
+    let positions: Vec<&Transform> = pos_query
+        .iter()
+        .map(|(transform, _)| transform)
         .collect();
 
-        cell.update(&cell_transform, &nearby_particles);
+    for p1 in positions {
+        let influence_radius: f32 = 75.0;
 
-        if nearby_particles.len() > 0 {
-            update_cell_colour(&cell.density, &mut fill);
+        let overlapping_cells: Vec<(_, f32)> = cell_query.iter_mut()
+            .filter_map(|(entity, p2, cell, fill)| {
+                let distance = (p1.translation - p2.translation).length();
+                if distance <= influence_radius {
+                    Some(((entity, p2, cell, fill), distance))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for ((_, _, mut cell, mut fill), distance) in overlapping_cells {
+            let density = smoothing_kernel(influence_radius, distance);
+            cell.update_density(density);
+            cell.update_cell_colour(&mut fill);
         }
     }
 }
 
-
-fn update_cell_colour(density: &f32, fill: &mut Fill) {
-    let red = density; 
-    let blue = 1.0 - density; 
-    let green = 1.0 - (red - blue).abs();
-
-    let colour = Color::rgb(*red, green, blue);
-
-    fill.color = colour;
+// fn calculate_density(pos_query: Query<(&Transform, With<Particle>)>,
+//                      mut cell_query: Query<(Entity, &Transform, &mut Cell, &mut Fill)>) {
     
-}
+//     let positions: Vec<&Transform> = pos_query
+//         .iter()
+//         .map(|(transform, _)| transform)
+//         .collect();
+
+//     positions.par_iter().for_each(|p1| {
+//         let influence_radius: f32 = 75.0;
+
+//         cell_query.par_iter_mut()
+//             .filter_map(|(entity, p2, cell, fill)| {
+//                 let distance = (p1.translation - p2.translation).length();
+//                 if distance <= influence_radius {
+//                     Some(((entity, p2, cell, fill), distance))
+//                 } else {
+//                     None
+//                 }
+//             })
+//             .for_each(|((_, _, mut cell, mut fill), distance)| {
+//                 let density = smoothing_kernel(influence_radius, distance);
+//                 cell.update_density(density);
+//                 cell.update_cell_colour(&mut fill);
+//             });
+//     });
+// }
+
+
+
+// let mut rng = thread_rng();
+// let mut density: f32 = 0.0;
+// let mut neighbours: Vec<&Transform> = Vec::new();
+// let mut neighbour_densities: Vec<f32> = Vec::new();
+// let mut neighbour_distances: Vec<f32> = Vec::new();
+
+// // Get all the particles in the scene
+// for (other_transform, _) in query.iter_mut() {
+//     // Calculate the distance between the two particles
+//     let distance = transform.translation.distance(other_transform.translation);
+//     // If the distance is less than the smoothing radius, add it to the neighbours list
+//     if distance < 20.0 {
+//         neighbours.push(other_transform);
+//         neighbour_distances.push(distance);
+//     }
+// }
+
+// // Calculate the density of the particle
+// for neighbour in neighbours {
+//     let distance = transform.translation.distance(neighbour.translation);
+//     let density = smoothing_kernel(20.0, distance);
+//     neighbour_densities.push(density);
+// }
+
+// for density in neighbour_densities {
+//     density += density;
+// }
+
+// // Update the particle's density
+// density = density / neighbours.len() as f32;
+// println!("Density: {}", density);
+// Cell::update_cell_colour(&density, &mut query.get_mut().unwrap().1);
